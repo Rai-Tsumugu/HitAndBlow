@@ -36,53 +36,71 @@ class HitAndBlowSolver:
                 new_candidates.append(c)
         
         self.candidates = new_candidates
-        print(f"  [AI] 候補数: {len(self.candidates)}")
+        # print(f"  [AI] 候補数: {len(self.candidates)}")
 
-    def suggest_move(self):
+    def suggest_move(self, on_progress=None):
         """
-        期待情報量（エントロピー）が最大になる手を提案する
+        現在の候補数に応じて戦略を切り替える
+        - 候補が多いとき: エントロピー最大化（情報収集優先）
+        - 候補が少ないとき: 勝率最大化（Minimax / 相手へのアシスト回避）
         """
-        # 1. 候補が1つならそれを答える
-        if len(self.candidates) == 1:
+        N = len(self.candidates)
+        
+        # 1. 確定しているならそれを答える
+        if N == 1:
             return self.candidates[0]
         
-        # 2. 初手は計算コスト削減のため固定
-        if len(self.candidates) == len(self.all_permutations):
+        # 2. 初手固定
+        if N == len(self.all_permutations):
             return self.first_guess
 
+        # 3. 戦略の切り替え
+        # 候補数が50以下なら、厳密な勝率計算を行う (Minimax)
+        if N <= 50:
+            return self.suggest_move_minimax(N, on_progress)
+        else:
+            return self.suggest_move_entropy(N, on_progress)
+
+    def suggest_move_entropy(self, N, on_progress=None):
+        """エントロピー最大化戦略 (従来のロジック)"""
         best_guess = None
         max_entropy = -1.0
         
-        # 3. 全通りの推測パターンについてシミュレーションを行う
-        #    (通常、残りの候補から選ぶより、全順列から選んだほうが情報量が高い場合があるが、
-        #     計算量削減のため候補数が多いときは「候補集合」から、
-        #     少なくなってきたら「全集合」から選ぶなりの工夫が可能。
-        #     ここでは最強を目指すため、常に「全集合」から探索するが、
-        #     速度が遅すぎる場合は候補集合のみにする)
-        
-        # 探索範囲の設定
-        # 候補が多いときは処理時間を短縮するために候補内から選ぶ (ヒューリスティック)
-        # 厳密な最強ではないが、実用的な速度を重視
+        # 候補が多いときは検索空間を間引くなどの最適化が可能だが、
+        # ここでは候補が十分減っている(<=200)なら全探索、そうでなければ候補内探索とする
         search_space = self.all_permutations if len(self.candidates) <= 200 else self.candidates
+        total_steps = len(search_space)
         
-        for guess in search_space:
-            # このguessをした時の、結果の分布を調べる
+        # judgeロジックをローカル変数に展開して高速化
+        candidates = self.candidates
+        
+        for i, guess in enumerate(search_space):
+            if on_progress and i % 100 == 0:
+                on_progress(i, total_steps)
+
             outcome_counts = {}
-            for secret_candidate in self.candidates:
-                h, b = self.logic.judge_with_secret(guess, secret_candidate)
-                outcome = (h, b)
-                outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+            for secret_candidate in candidates:
+                # judge_with_secret のインライン化
+                hit = 0
+                blow = 0
+                for j in range(self.digits):
+                    g = guess[j]
+                    if g == secret_candidate[j]:
+                        hit += 1
+                    elif g in secret_candidate:
+                        blow += 1
+                
+                outcome = (hit, blow)
+                if outcome in outcome_counts:
+                    outcome_counts[outcome] += 1
+                else:
+                    outcome_counts[outcome] = 1
             
-            # エントロピー計算
-            # E = - sum( p * log2(p) )
             entropy = 0.0
-            total = len(self.candidates)
             for count in outcome_counts.values():
-                p = count / total
+                p = count / N
                 entropy -= p * math.log2(p)
             
-            # 最大エントロピーを更新
-            # エントロピーが同じなら、それが候補に含まれている手（自分自身が正解の可能性がある手）を優先する
             if entropy > max_entropy:
                 max_entropy = entropy
                 best_guess = guess
@@ -91,4 +109,75 @@ class HitAndBlowSolver:
                     best_guess = guess
         
         return best_guess
+
+    def suggest_move_minimax(self, N, on_progress=None):
+        """勝率最大化戦略 (Minimax) - 高速化版"""
+        best_guess = None
+        max_score = -1.0
+        
+        search_space = self.all_permutations
+        total_steps = len(search_space)
+        candidates = self.candidates
+        
+        for i, guess in enumerate(search_space):
+            if on_progress and i % 50 == 0:
+                on_progress(i, total_steps)
+
+            outcome_counts = {}
+            # インライン化したジャッジロジック
+            for secret_candidate in candidates:
+                hit = 0
+                blow = 0
+                for j in range(self.digits):
+                    g = guess[j]
+                    if g == secret_candidate[j]:
+                        hit += 1
+                    elif g in secret_candidate:
+                        blow += 1
+                        
+                outcome = (hit, blow)
+                if outcome in outcome_counts:
+                    outcome_counts[outcome] += 1
+                else:
+                    outcome_counts[outcome] = 1
+            
+            # スコア計算
+            p_immediate_win = (1.0 / N) if guess in self.candidates else 0.0
+            p_survive_next = 0.0
+            
+            for count in outcome_counts.values():
+                prob_outcome = count / N
+                # _estimate_win_rate のインライン展開 (呼び出しコスト削減)
+                # k = count
+                if count > 0:
+                    opponent_win_rate = ((count + 1) // 2) / count
+                else:
+                    opponent_win_rate = 0
+                
+                p_survive_next += prob_outcome * (1.0 - opponent_win_rate)
+            
+            total_score = p_immediate_win + p_survive_next
+            
+            if total_score > max_score:
+                max_score = total_score
+                best_guess = guess
+            elif total_score == max_score:
+                if best_guess not in self.candidates and guess in self.candidates:
+                    best_guess = guess
+                    
+        return best_guess
+
+    def _estimate_win_rate(self, k):
+        """
+        残り候補数 k のときの、手番プレイヤーの勝率（概算）
+        k=1 -> 1.0 (必勝)
+        k=2 -> 0.5 (1/2で当たり、外れたら相手必勝)
+        k=3 -> 0.66 (1/3で当たり、2/3で相手が残り2(0.5)→自分は0.5勝てる) 
+           -> 1/3 + 2/3 * 0.5 = 2/3
+        一般項: int((k+1)/2) / k
+           k=odd(2m+1) -> (m+1)/(2m+1) ~ 0.5
+           k=even(2m)  -> m/2m = 0.5
+        """
+        if k <= 0: return 0
+        return math.floor((k + 1) / 2) / k
 
